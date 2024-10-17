@@ -127,11 +127,14 @@ static enum resp_states check_psn(struct rxe_qp *qp,
 	case IB_QPT_RC:
 		if (diff > 0) {
 			if (qp->resp.sent_psn_nak)
-				return RESPST_CLEANUP;
+				//return RESPST_CLEANUP;
+				return RESPST_CHK_OP_VALID;
+
 
 			qp->resp.sent_psn_nak = 1;
 			rxe_counter_inc(rxe, RXE_CNT_OUT_OF_SEQ_REQ);
-			return RESPST_ERR_PSN_OUT_OF_SEQ;
+			return RESPST_CHK_OP_VALID;
+			//return RESPST_ERR_PSN_OUT_OF_SEQ;
 
 		} else if (diff < 0) {
 			rxe_counter_inc(rxe, RXE_CNT_DUP_REQ);
@@ -419,7 +422,8 @@ static enum resp_states check_rkey(struct rxe_qp *qp,
 			qp->resp.offset = 0;
 			qp->resp.rkey = reth_rkey(pkt);
 			qp->resp.resid = reth_len(pkt);
-			qp->resp.length = reth_len(pkt);
+			if(pkt->mask & RXE_START_MASK)
+				qp->resp.length = reth_len(pkt);
 		}
 		access = (pkt->mask & RXE_READ_MASK) ? IB_ACCESS_REMOTE_READ
 						     : IB_ACCESS_REMOTE_WRITE;
@@ -430,6 +434,8 @@ static enum resp_states check_rkey(struct rxe_qp *qp,
 		qp->resp.resid = sizeof(u64);
 		access = IB_ACCESS_REMOTE_ATOMIC;
 	} else {
+		if (qp->resp.sent_psn_nak)
+				return RESPST_ERR_PSN_OUT_OF_SEQ;
 		return RESPST_EXECUTE;
 	}
 
@@ -437,6 +443,8 @@ static enum resp_states check_rkey(struct rxe_qp *qp,
 	if ((pkt->mask & (RXE_READ_MASK | RXE_WRITE_OR_SEND)) &&
 	    (pkt->mask & RXE_RETH_MASK) &&
 	    reth_len(pkt) == 0) {
+			if (qp->resp.sent_psn_nak)
+				return RESPST_ERR_PSN_OUT_OF_SEQ;
 		return RESPST_EXECUTE;
 	}
 
@@ -449,16 +457,16 @@ static enum resp_states check_rkey(struct rxe_qp *qp,
 		mw = rxe_lookup_mw(qp, access, rkey);
 		if (!mw) {
 			pr_err("%s: no MW matches rkey %#x\n", __func__, rkey);
-			state = RESPST_ERR_RKEY_VIOLATION;
-			goto err;
-		}
+		state = RESPST_ERR_RKEY_VIOLATION;
+		goto err;
+	}
 
 		mr = mw->mr;
 		if (!mr) {
 			pr_err("%s: MW doesn't have an MR\n", __func__);
-			state = RESPST_ERR_RKEY_VIOLATION;
-			goto err;
-		}
+		state = RESPST_ERR_RKEY_VIOLATION;
+		goto err;
+	}
 
 		if (mw->access & IB_ZERO_BASED)
 			qp->resp.offset = mw->addr;
@@ -503,6 +511,8 @@ static enum resp_states check_rkey(struct rxe_qp *qp,
 	WARN_ON_ONCE(qp->resp.mr);
 
 	qp->resp.mr = mr;
+	if (qp->resp.sent_psn_nak)
+		return RESPST_ERR_PSN_OUT_OF_SEQ;
 	return RESPST_EXECUTE;
 
 err:
@@ -544,6 +554,24 @@ static enum resp_states write_data_in(struct rxe_qp *qp,
 
 	qp->resp.va += data_len;
 	qp->resp.resid -= data_len;
+
+out:
+	return rc;
+}
+
+static enum resp_states write_data_in_sack(struct rxe_qp *qp,
+				      struct rxe_pkt_info *pkt)
+{
+	enum resp_states rc = RESPST_NONE;
+	int	err;
+	int data_len = payload_size(pkt);
+
+	err = rxe_mem_copy(qp->resp.mr, qp->resp.va, payload_addr(pkt),
+			   data_len, to_mem_obj, NULL);
+	if (err) {
+		rc = RESPST_ERR_RKEY_VIOLATION;
+		goto out;
+	}
 
 out:
 	return rc;
@@ -627,6 +655,17 @@ static struct sk_buff *prepare_ack_packet(struct rxe_qp *qp,
 	if (ack->mask & RXE_AETH_MASK) {
 		aeth_set_syn(ack, syndrome);
 		aeth_set_msn(ack, qp->resp.msn);
+		aeth_set_ncqe(ack, qp->resp.numCQEdone);
+		aeth_set_cumACK(ack, qp->resp.ack_psn);
+		/*if (syndrome == AETH_NAK_PSN_SEQ_ERROR)
+		{
+			aeth_set_ncqe(ack, qp->resp.numCQEdone);
+			aeth_set_cumACK(ack, qp->resp.ack_psn);
+		}
+		else {
+			aeth_set_ncqe(ack, 0);
+			aeth_set_cumACK(ack, 0);
+		}*/
 	}
 
 	if (ack->mask & RXE_ATMACK_MASK)
@@ -778,7 +817,7 @@ static enum resp_states execute(struct rxe_qp *qp, struct rxe_pkt_info *pkt)
 						sizeof(hdr.reserved));
 				memcpy(&hdr.roce4grh, ip_hdr(skb),
 						sizeof(hdr.roce4grh));
-				err = send_data_in(qp, &hdr, sizeof(hdr));
+			err = send_data_in(qp, &hdr, sizeof(hdr));
 			} else {
 				err = send_data_in(qp, ipv6_hdr(skb),
 						sizeof(hdr));
@@ -790,7 +829,159 @@ static enum resp_states execute(struct rxe_qp *qp, struct rxe_pkt_info *pkt)
 		if (err)
 			return err;
 	} else if (pkt->mask & RXE_WRITE_MASK) {
-		err = write_data_in(qp, pkt);
+		err = write_data_in_sack(qp, pkt);
+		if (err)
+			return err;
+	} else if (pkt->mask & RXE_READ_MASK) {
+		/* For RDMA Read we can increment the msn now. See C9-148. */
+		qp->resp.msn++;
+		return RESPST_READ_REPLY;
+	} else if (pkt->mask & RXE_ATOMIC_MASK) {
+		err = process_atomic(qp, pkt);
+		if (err)
+			return err;
+	} else {
+		/* Unreachable */
+		WARN_ON_ONCE(1);
+	}
+	if (pkt->mask & RXE_IETH_MASK) {
+		u32 rkey = ieth_rkey(pkt);
+
+		err = invalidate_rkey(qp, rkey);
+		if (err)
+			return RESPST_ERR_INVALIDATE_RKEY;
+
+	__uint128_t temp = qp->resp.ooo_bitmap1 | qp->resp.ooo_bitmap2;
+
+	qp->resp.numCQEdone = 0;
+
+	u8 msnInc = 0, bits_to_shift = 0; //LOGBDP bit
+
+	//bitmapNotEmpty
+	if(temp != 0) {
+		//last pos at bitmap is reserved for expected pkt, shift it out to process.
+		qp->resp.ooo_bitmap1 = qp->resp.ooo_bitmap1 >> 1;
+		qp->resp.ooo_bitmap2 = qp->resp.ooo_bitmap2 >> 1;
+
+		u8 bits_to_shiftArr[BDPBY32], msnIncArr[BDPBY32], localNumCQEDoneArr[BDPBY32]; //LOGBDP bit
+
+		//collectPartStats: chop BDP-bit bitmap into 32-bit chunks to process
+		for(int i=0; i < BDPBY32; i++) {
+			int idx = i << 5; //shift idx to the right pos to process bitmap chunks
+			//extract chunks
+			u32 part1 = extractBits(qp->resp.ooo_bitmap1,idx, idx + 31);
+			u32 part2 = extractBits(qp->resp.ooo_bitmap2,idx, idx + 31);
+			u32 part = (part1 | part2);//every received packet
+			u8 bits_to_shift_part = 0;
+			if((part & 0xffff) == 0xffff) {
+				bits_to_shift_part += 16;
+				part = part >> 16;
+			}
+			if((part & 0xff) == 0xff) {
+				bits_to_shift_part += 8;
+				part = part >> 8;
+			}
+			if((part & 0xf) == 0xf) {
+				bits_to_shift_part += 4;
+				part = part >> 4;
+			}
+			if((part & 3) == 3) {
+				bits_to_shift_part += 2;
+				part = part >> 2;
+			}
+			if((part & 1) == 1){
+				bits_to_shift_part += 1;
+				part = part >> 1;
+			}
+			if((part & 1) == 1){
+				bits_to_shift_part += 1;
+			}
+			part2 = part2 << (32 - bits_to_shift_part);
+			part2 = part2 >> (32 - bits_to_shift_part); //keep only the last-packet mark that belongs to a completed msg, i.e. shift out the incomplete ones.
+			msnIncArr[i] = popcount32(part2); //count msn inc val.
+			localNumCQEDoneArr[i] = popcount32(part1 & part2); //count cqe num to be expired.
+			bits_to_shiftArr[i] = bits_to_shift_part; //count bits to be advanced in bitmaps.
+
+			//Since the bitmap is processed in chunks. Chances are current chunk possesses continuous lower bit ones while a certain previous chunk's higher bits are 0s,
+			//i.e. the packets aren't continuous between chunks which means that certain msg hasn't been completed yet.
+			//such msg shouldn't cause msn inc, bits advance&CQE num increment.
+			bool factor = 1;
+			if(i > 0)
+			{
+				u8 factor_u = bits_to_shiftArr[i - 1] >> 5;//LOGBDP bit
+				factor = !!factor_u;//cast to bool
+			}
+
+			bits_to_shiftArr[i] *= factor;
+			msnIncArr[i] *= factor;
+			localNumCQEDoneArr[i] *= factor;
+
+			bits_to_shift += bits_to_shiftArr[i];
+			msnInc += msnIncArr[i];
+			qp->resp.numCQEdone += localNumCQEDoneArr[i];
+
+		}
+
+		qp->resp.ooo_bitmap1 = qp->resp.ooo_bitmap1 >> bits_to_shift;
+		qp->resp.ooo_bitmap2 = qp->resp.ooo_bitmap2 >> bits_to_shift;
+		qp->resp.msn += msnInc;
+	}
+
+	/* next expected psn, read handles this separately */
+	qp->resp.psn = (pkt->psn + 1 + bits_to_shift) & BTH_PSN_MASK;
+	qp->resp.ack_psn = qp->resp.psn;
+
+	qp->resp.opcode = pkt->opcode;
+	qp->resp.status = IB_WC_SUCCESS;
+
+	if (pkt->mask & RXE_END_MASK) {
+		/* Last packet. */
+		qp->resp.msn++;
+	}
+	if (pkt->mask & RXE_COMP_MASK) {
+		/* We successfully processed this new request. */
+		//qp->resp.msn++;
+		qp->resp.numCQEdone++;
+		return RESPST_COMPLETE;
+	} else if (qp_type(qp) == IB_QPT_RC)
+		return RESPST_ACKNOWLEDGE;
+	else
+		return RESPST_CLEANUP;
+}
+
+//if arrived packet's sequence number is greater than expected, prepare an NACK and mark bitmap.
+//TODO:read process should be modified, now it's only for semantic completeness. As well as send_data_in.
+static enum resp_states ooo_handling(struct rxe_qp *qp, struct rxe_pkt_info *pkt)
+{
+	qp->resp.aeth_syndrome = AETH_NAK_PSN_SEQ_ERROR;
+	__uint128_t temp = 1;
+	temp = temp << (pkt->psn - qp->resp.psn);
+	if(pkt->mask & RXE_END_MASK) {
+		qp->resp.ooo_bitmap2 = qp->resp.ooo_bitmap2 | temp;
+	}
+	if((pkt->mask & RXE_COMP_MASK) || !(pkt->mask & RXE_END_MASK)) {
+		qp->resp.ooo_bitmap1 = qp->resp.ooo_bitmap1 | temp;
+	}
+
+	enum resp_states err;
+
+	if (pkt->mask & RXE_SEND_MASK) {
+		if (qp_type(qp) == IB_QPT_UD ||
+		    qp_type(qp) == IB_QPT_SMI ||
+		    qp_type(qp) == IB_QPT_GSI) {
+			union rdma_network_hdr hdr;
+
+			build_rdma_network_hdr(&hdr, pkt);
+
+			err = send_data_in(qp, &hdr, sizeof(hdr));
+			if (err)
+				return err;
+		}
+		err = send_data_in(qp, payload_addr(pkt), payload_size(pkt));
+		if (err)
+			return err;
+	} else if (pkt->mask & RXE_WRITE_MASK) {
+		err = write_data_in_sack(qp, pkt);
 		if (err)
 			return err;
 	} else if (pkt->mask & RXE_READ_MASK) {
@@ -806,28 +997,11 @@ static enum resp_states execute(struct rxe_qp *qp, struct rxe_pkt_info *pkt)
 		WARN_ON_ONCE(1);
 	}
 
-	if (pkt->mask & RXE_IETH_MASK) {
-		u32 rkey = ieth_rkey(pkt);
-
-		err = invalidate_rkey(qp, rkey);
-		if (err)
-			return RESPST_ERR_INVALIDATE_RKEY;
-	}
-
-	if (pkt->mask & RXE_END_MASK)
-		/* We successfully processed this new request. */
-		qp->resp.msn++;
-
-	/* next expected psn, read handles this separately */
-	qp->resp.psn = (pkt->psn + 1) & BTH_PSN_MASK;
-	qp->resp.ack_psn = qp->resp.psn;
-
 	qp->resp.opcode = pkt->opcode;
 	qp->resp.status = IB_WC_SUCCESS;
 
-	if (pkt->mask & RXE_COMP_MASK)
-		return RESPST_COMPLETE;
-	else if (qp_type(qp) == IB_QPT_RC)
+	//send_ack(qp, pkt, AETH_NAK_PSN_SEQ_ERROR, qp->resp.psn);
+	if (qp_type(qp) == IB_QPT_RC)
 		return RESPST_ACKNOWLEDGE;
 	else
 		return RESPST_CLEANUP;
@@ -1063,7 +1237,7 @@ static enum resp_states duplicate_request(struct rxe_qp *qp,
 	if (pkt->mask & RXE_SEND_MASK ||
 	    pkt->mask & RXE_WRITE_MASK) {
 		/* SEND. Ack again and cleanup. C9-105. */
-		send_ack(qp, pkt, AETH_ACK_UNLIMITED, prev_psn);
+			send_ack(qp, pkt, AETH_ACK_UNLIMITED, prev_psn);
 		return RESPST_CLEANUP;
 	} else if (pkt->mask & RXE_READ_MASK) {
 		struct resp_res *res;
@@ -1209,6 +1383,7 @@ int rxe_responder(void *arg)
 	rxe_add_ref(qp);
 
 	qp->resp.aeth_syndrome = AETH_ACK_UNLIMITED;
+	qp->resp.numCQEdone = 0;
 
 	if (!qp->valid) {
 		ret = -EINVAL;
@@ -1270,8 +1445,9 @@ int rxe_responder(void *arg)
 			break;
 		case RESPST_ERR_PSN_OUT_OF_SEQ:
 			/* RC only - Class B. Drop packet. */
-			send_ack(qp, pkt, AETH_NAK_PSN_SEQ_ERROR, qp->resp.psn);
-			state = RESPST_CLEANUP;
+			state = ooo_handling(qp, pkt);
+			/*send_ack(qp, pkt, AETH_NAK_PSN_SEQ_ERROR, qp->resp.psn);
+			state = RESPST_CLEANUP;*/
 			break;
 
 		case RESPST_ERR_TOO_MANY_RDMA_ATM_REQ:

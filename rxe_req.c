@@ -14,6 +14,58 @@
 static int next_opcode(struct rxe_qp *qp, struct rxe_send_wqe *wqe,
 		       u32 opcode);
 
+//bitshift operations to 'find first zero' (or find new hole), done by dividing the bitmap into chunks of 32 and operating on them in parallel.
+static inline bool findNextHoleTx(__uint128_t bitmap, u8 nextHole) {
+	u8 bits_to_shiftArr[BDPBY32];
+	u8 bits_to_shift = 0;
+
+	//collectPartStats:
+	for(int i=0; i < BDPBY32; i++) {
+		int idx = i << 5;
+		u32 part = extractBits(bitmap,idx, idx + 31);
+		u8 bits_to_shift_part = 0;
+		if((part & 0xffff) == 0xffff) {
+			bits_to_shift_part += 16;
+			part = part >> 16;
+		}
+		if((part & 0xff) == 0xff) {
+			bits_to_shift_part += 8;
+			part = part >> 8;
+		}
+		if((part & 0xf) == 0xf) {
+			bits_to_shift_part += 4;
+			part = part >> 4;
+		}
+		if((part & 3) == 3) {
+			bits_to_shift_part += 2;
+			part = part >> 2;
+		}
+		if((part & 1) == 1){
+			bits_to_shift_part += 1;
+			part = part >> 1;
+		}
+		if((part & 1) == 1){
+			bits_to_shift_part += 1;
+		}
+		bits_to_shiftArr[i] = bits_to_shift_part;
+
+		bool factor = 1;
+		if(i > 0)
+		{
+			u8 factor_u = bits_to_shiftArr[i - 1] >> 5;//LOGBDP bit
+			factor = !!factor_u;
+		}
+
+		bits_to_shiftArr[i] *= factor;
+		bits_to_shift += bits_to_shiftArr[i];
+	}
+	bitmap = bitmap >> bits_to_shift;
+	nextHole = bits_to_shift;
+	if(bitmap == 0) return 0;
+	return 1;
+}
+
+
 static inline void retry_first_write_send(struct rxe_qp *qp,
 					  struct rxe_send_wqe *wqe,
 					  unsigned int mask, int npsn)
@@ -408,8 +460,8 @@ static struct sk_buff *init_req_packet(struct rxe_qp *qp,
 					 qp->attr.dest_qp_num;
 
 	if (qp_type(qp) != IB_QPT_UD && qp_type(qp) != IB_QPT_UC)
-		ack_req = ((pkt->mask & RXE_END_MASK) ||
-			   (qp->req.noack_pkts++ > RXE_MAX_PKT_PER_ACK));
+	ack_req = ((pkt->mask & RXE_END_MASK) ||
+		(qp->req.noack_pkts++ > RXE_MAX_PKT_PER_ACK));
 	if (ack_req)
 		qp->req.noack_pkts = 0;
 
@@ -419,8 +471,16 @@ static struct sk_buff *init_req_packet(struct rxe_qp *qp,
 	/* init optional headers */
 	if (pkt->mask & RXE_RETH_MASK) {
 		reth_set_rkey(pkt, ibwr->wr.rdma.rkey);
-		reth_set_va(pkt, wqe->iova);
-		reth_set_len(pkt, wqe->dma.resid);
+		if(pkt->mask & RXE_START_MASK)
+		{
+			wqe->first_psn = pkt->psn;
+			reth_set_va(pkt, wqe->iova);
+			reth_set_len(pkt, wqe->dma.resid);
+		}
+		else{
+			reth_set_va(pkt, wqe->iova + (pkt->psn - wqe->first_psn) * payload_size(pkt)); // set va for selective retrans to write data in correctly.
+			reth_set_len(pkt, wqe->dma.resid - (pkt->psn - wqe->first_psn) * payload_size(pkt));
+		}
 	}
 
 	if (pkt->mask & RXE_IMMDT_MASK)
@@ -519,29 +579,31 @@ static void update_wqe_psn(struct rxe_qp *qp,
 	if (pkt->mask & RXE_READ_MASK)
 		qp->req.psn = (wqe->first_psn + num_pkt) & BTH_PSN_MASK;
 	else
-		qp->req.psn = (qp->req.psn + 1) & BTH_PSN_MASK;
+		qp->req.nextSNtoSend = (qp->req.nextSNtoSend + 1) & BTH_PSN_MASK;
 }
 
 static void save_state(struct rxe_send_wqe *wqe,
 		       struct rxe_qp *qp,
 		       struct rxe_send_wqe *rollback_wqe,
-		       u32 *rollback_psn)
+		       u32 *rollback_psn, u32 *rollback_nextpsn)
 {
 	rollback_wqe->state     = wqe->state;
 	rollback_wqe->first_psn = wqe->first_psn;
 	rollback_wqe->last_psn  = wqe->last_psn;
 	*rollback_psn		= qp->req.psn;
+	*rollback_nextpsn = qp->req.nextSNtoSend;
 }
 
 static void rollback_state(struct rxe_send_wqe *wqe,
 			   struct rxe_qp *qp,
 			   struct rxe_send_wqe *rollback_wqe,
-			   u32 rollback_psn)
+			   u32 rollback_psn, u32 rollback_nextpsn)
 {
 	wqe->state     = rollback_wqe->state;
 	wqe->first_psn = rollback_wqe->first_psn;
 	wqe->last_psn  = rollback_wqe->last_psn;
 	qp->req.psn    = rollback_psn;
+	qp->req.nextSNtoSend = rollback_nextpsn;
 }
 
 static void update_state(struct rxe_qp *qp, struct rxe_send_wqe *wqe,
@@ -625,6 +687,7 @@ int rxe_requester(void *arg)
 	int ret;
 	struct rxe_send_wqe rollback_wqe;
 	u32 rollback_psn;
+	u32 rollback_nextpsn;
 	struct rxe_queue *q = qp->sq.queue;
 
 	rxe_add_ref(qp);
@@ -649,6 +712,55 @@ next_wqe:
 	}
 
 	wqe = req_next_wqe(qp);
+	//if a packet has been marked for retransmission and if it has not already been acked,
+	//set it as the packet to be sent, update the recovery sequence,
+	//disable further retransmission, and set flag to find new hole in bitmap.
+	//inRecovery is set to true, if the retransmit SN is equal to cumulative ack.
+	if((qp->req.doRetransmit) && (qp->req.retransmitSN >= qp->comp.psn)) {
+			if(qp->req.retransmitSN == qp->comp.psn) qp->req.inRecovery = true;
+			qp->req.psn = qp->req.retransmitSN;
+			qp->req.recoverSN = qp->req.nextSNtoSend - 1;
+			qp->req.doRetransmit = false;
+			qp->req.findNewHole = true;
+			unsigned int maski = wr_opcode_mask(wqe->wr.opcode, qp);
+			u32 npsn = (qp->comp.psn - wqe->first_psn) &
+					BTH_PSN_MASK;
+			retry_first_write_send(qp, wqe, maski, npsn);//set dma parameters.
+			//TODO:Maybe need to set wqe index as well?
+
+	} else {
+		//if packet marked for retransmission has been acked, disable flag to find new hole.
+		if(qp->req.doRetransmit) qp->req.findNewHole = false;
+		qp->req.doRetransmit = false;
+		//prepare transmission of a new packet,
+		//if the number of packets in flight is smaller than the maxCap (set to BDP). Maybe use RXE_INFLIGHT_SKBS_PER_QP_HIGH?
+		qp->req.psn = qp->req.nextSNtoSend;
+	}
+
+	//if the flag to find new hole is set, search for the next hole in the bitmap.
+	if(qp->req.findNewHole) {
+		__uint128_t tempBitmap;// BDP-bit
+		u32 startidx;// 32 bit
+		if(qp->req.retransmitSN >= qp->comp.psn) {
+			tempBitmap = qp->comp.sack_bitmap >> (qp->req.retransmitSN - qp->comp.psn + 1); //shift out the used part.
+			startidx = qp->req.retransmitSN + 1;
+		} else {
+			//reset the bitmap
+			tempBitmap = qp->comp.sack_bitmap;
+			startidx = qp->comp.psn;
+		}
+		u8 nextHole = 0; // LOGBDP bit
+		bool holeFound;
+		holeFound = findNextHoleTx(tempBitmap, nextHole);
+		//if hole is found, prepare the sequence for retransmission.
+		if(holeFound) {
+			qp->req.retransmitSN = nextHole + startidx;
+			qp->req.doRetransmit = true;
+		}
+		qp->req.findNewHole = false;
+	}
+
+
 	if (unlikely(!wqe))
 		goto exit;
 
@@ -657,19 +769,20 @@ next_wqe:
 		if (unlikely(ret))
 			goto err;
 		else
-			goto next_wqe;
+		goto next_wqe;
 	}
 
-	if (unlikely(qp_type(qp) == IB_QPT_RC &&
+	//incompatible wait mechanism.
+	/*if (unlikely(qp_type(qp) == IB_QPT_RC &&
 		psn_compare(qp->req.psn, (qp->comp.psn +
 				RXE_MAX_UNACKED_PSNS)) > 0)) {
 		qp->req.wait_psn = 1;
 		goto exit;
-	}
+	}*/
 
 	/* Limit the number of inflight SKBs per QP */
 	if (unlikely(atomic_read(&qp->skb_out) >
-		     RXE_INFLIGHT_SKBS_PER_QP_HIGH)) {
+		     BDP)) {
 		qp->need_req_skb = 1;
 		goto exit;
 	}
@@ -736,14 +849,16 @@ next_wqe:
 	 * rxe_xmit_packet().
 	 * Otherwise, completer might initiate an unjustified retry flow.
 	 */
-	save_state(wqe, qp, &rollback_wqe, &rollback_psn);
-	update_wqe_state(qp, wqe, &pkt);
+	save_state(wqe, qp, &rollback_wqe, &rollback_psn, &rollback_nextpsn);
+	update_wqe_state(qp, wqe, &pkt);//TODO:maybe set state based on sack?
 	update_wqe_psn(qp, wqe, &pkt, payload);
 	ret = rxe_xmit_packet(qp, &pkt, skb);
+	//pr_alert("packet sent, psn is %d, opcode is %s", pkt.psn, rxe_opcode[pkt.opcode].name);
+	//msleep(1000);
 	if (ret) {
 		qp->need_req_skb = 1;
 
-		rollback_state(wqe, qp, &rollback_wqe, rollback_psn);
+		rollback_state(wqe, qp, &rollback_wqe, rollback_psn, rollback_nextpsn);
 
 		if (ret == -EAGAIN) {
 			rxe_run_task(&qp->req.task, 1);

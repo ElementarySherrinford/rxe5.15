@@ -200,6 +200,7 @@ static void rxe_qp_init_misc(struct rxe_dev *rxe, struct rxe_qp *qp,
 	spin_lock_init(&qp->comp.task.state_lock);
 
 	spin_lock_init(&qp->sq.sq_lock);
+	spin_lock_init(&qp->ssq.sq_lock);
 	spin_lock_init(&qp->rq.producer_lock);
 	spin_lock_init(&qp->rq.consumer_lock);
 
@@ -233,6 +234,7 @@ static int rxe_qp_init_req(struct rxe_dev *rxe, struct rxe_qp *qp,
 	qp->src_port = RXE_ROCE_V2_SPORT +
 		(hash_32_generic(qp_num(qp), 14) & 0x3fff);
 	qp->sq.max_wr		= init->cap.max_send_wr;
+	qp->ssq.max_wr		= init->cap.max_send_wr;
 
 	/* These caps are limited by rxe_qp_chk_cap() done by the caller */
 	wqe_size = max_t(int, init->cap.max_send_sge * sizeof(struct ib_sge),
@@ -240,12 +242,15 @@ static int rxe_qp_init_req(struct rxe_dev *rxe, struct rxe_qp *qp,
 	qp->sq.max_sge = init->cap.max_send_sge =
 		wqe_size / sizeof(struct ib_sge);
 	qp->sq.max_inline = init->cap.max_inline_data = wqe_size;
+	qp->ssq.max_sge = init->cap.max_send_sge =
+		wqe_size / sizeof(struct ib_sge);
+	qp->ssq.max_inline = init->cap.max_inline_data = wqe_size;
 	wqe_size += sizeof(struct rxe_send_wqe);
 
 	type = QUEUE_TYPE_FROM_CLIENT;
-	qp->sq.queue = rxe_queue_init(rxe, &qp->sq.max_wr,
-				wqe_size, type);
-	if (!qp->sq.queue)
+	qp->sq.queue = rxe_queue_init(rxe, &qp->sq.max_wr, wqe_size, type);
+	qp->ssq.queue = rxe_queue_init(rxe, &qp->sq.max_wr, wqe_size, type);
+	if (!qp->sq.queue || !qp->ssq.queue)
 		return -ENOMEM;
 
 	err = do_mmap_info(rxe, uresp ? &uresp->sq_mi : NULL, udata,
@@ -362,6 +367,8 @@ int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
 err2:
 	rxe_queue_cleanup(qp->sq.queue);
 	qp->sq.queue = NULL;
+	rxe_queue_cleanup(qp->ssq.queue);
+	qp->ssq.queue = NULL;
 err1:
 	qp->pd = NULL;
 	qp->rcq = NULL;
@@ -517,6 +524,7 @@ static void rxe_qp_reset(struct rxe_qp *qp)
 		__rxe_do_task(&qp->comp.task);
 		__rxe_do_task(&qp->req.task);
 		rxe_queue_reset(qp->sq.queue);
+		rxe_queue_reset(qp->ssq.queue);
 	}
 
 	/* cleanup attributes */
@@ -682,6 +690,7 @@ int rxe_qp_from_attr(struct rxe_qp *qp, struct ib_qp_attr *attr, int mask,
 	if (mask & IB_QP_SQ_PSN) {
 		qp->attr.sq_psn = (attr->sq_psn & BTH_PSN_MASK);
 		qp->req.psn = qp->attr.sq_psn;
+		qp->req.nextSNtoSend = qp->attr.sq_psn;
 		qp->comp.psn = qp->attr.sq_psn;
 		pr_debug("qp#%d set req psn = 0x%x\n", qp_num(qp), qp->req.psn);
 	}
@@ -807,6 +816,9 @@ static void rxe_qp_do_cleanup(struct work_struct *work)
 
 	if (qp->sq.queue)
 		rxe_queue_cleanup(qp->sq.queue);
+
+	if (qp->ssq.queue)
+		rxe_queue_cleanup(qp->ssq.queue);
 
 	if (qp->srq)
 		rxe_drop_ref(qp->srq);

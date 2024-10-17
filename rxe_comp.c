@@ -27,6 +27,7 @@ enum comp_state {
 	COMPST_ERROR,
 	COMPST_EXIT, /* We have an issue, and we want to rerun the completer */
 	COMPST_DONE, /* The completer finished successflly */
+	COMPST_CQEERR,
 };
 
 static char *comp_state_name[] =  {
@@ -45,6 +46,7 @@ static char *comp_state_name[] =  {
 	[COMPST_ERROR]			= "ERROR",
 	[COMPST_EXIT]			= "EXIT",
 	[COMPST_DONE]			= "DONE",
+	[COMPST_CQEERR]			= "CQEERR"
 };
 
 static unsigned long rnrnak_usec[32] = {
@@ -177,6 +179,7 @@ static inline enum comp_state check_psn(struct rxe_qp *qp,
 	/* check to see if response is past the oldest WQE. if it is, complete
 	 * send/write or error read/atomic
 	 */
+	pr_alert("received ack psn is %d", pkt->psn);
 	diff = psn_compare(pkt->psn, wqe->last_psn);
 	if (diff > 0) {
 		if (wqe->state == wqe_state_pending) {
@@ -213,6 +216,7 @@ static inline enum comp_state check_ack(struct rxe_qp *qp,
 {
 	unsigned int mask = pkt->mask;
 	u8 syn;
+	u32 cumAck;
 	struct rxe_dev *rxe = to_rdev(qp->ibqp.device);
 
 	/* Check the sequence only */
@@ -281,10 +285,41 @@ static inline enum comp_state check_ack(struct rxe_qp *qp,
 		return COMPST_ATOMIC;
 
 	case IB_OPCODE_RC_ACKNOWLEDGE:
+		cumAck = aeth_cumACK(pkt);
+		//update next sequence to send, if cumulative ack is higher.
+		if(psn_compare(cumAck, qp->req.nextSNtoSend) > 0)
+			qp->req.nextSNtoSend = cumAck;
+
+		//check if any new packets are cumulatively acked and update last ack value and the bitmap.
+		bool newAck = false;
+		if(psn_compare(cumAck, qp->comp.psn) > 0) {
+			newAck = true;
+			qp->comp.sack_bitmap = qp->comp.sack_bitmap >> (cumAck - qp->comp.psn); //keep the pos 0 of the sack bitmap to be lACK pkt.
+			qp->comp.psn = cumAck;
+		}
+
 		syn = aeth_syn(pkt);
 		switch (syn & AETH_TYPE_MASK) {
 		case AETH_ACK:
 			reset_retry_counters(qp);
+			//when cumulative ack is greater than recovery sequence,
+			//exit recovery and disable flags for retransmission and bitmap lookup.
+			if (psn_compare(cumAck, qp->req.recoverSN) > 0) {
+				qp->req.inRecovery = false;
+				qp->req.findNewHole = false;
+				qp->req.doRetransmit = false;
+			}
+			//if new packets have been acked,
+			if (newAck) {
+				if(qp->req.inRecovery) {
+					//partial ack: retransmit this packet only if it has not already been retransmitted. i.e. update retransmitSN to avoid duplicate retransmit.
+					if((qp->req.retransmitSN < qp->comp.psn) || ((qp->req.retransmitSN == qp->comp.psn) && (qp->req.doRetransmit))) {
+						qp->req.retransmitSN = qp->comp.psn;
+						qp->req.doRetransmit = true;
+						qp->req.findNewHole = false;
+					}
+				}
+			}
 			return COMPST_WRITE_SEND;
 
 		case AETH_RNR_NAK:
@@ -295,9 +330,9 @@ static inline enum comp_state check_ack(struct rxe_qp *qp,
 			switch (syn) {
 			case AETH_NAK_PSN_SEQ_ERROR:
 				/* a nak implicitly acks all packets with psns
-				 * before
+				 * before(original ooo handling routine)
 				 */
-				if (psn_compare(pkt->psn, qp->comp.psn) > 0) {
+				/*if (psn_compare(pkt->psn, qp->comp.psn) > 0) {
 					rxe_counter_inc(rxe,
 							RXE_CNT_RCV_SEQ_ERR);
 					qp->comp.psn = pkt->psn;
@@ -306,7 +341,64 @@ static inline enum comp_state check_ack(struct rxe_qp *qp,
 						rxe_run_task(&qp->req.task, 0);
 					}
 				}
-				return COMPST_ERROR_RETRY;
+				return COMPST_ERROR_RETRY;*/
+				if (psn_compare(cumAck, qp->comp.psn) > 0) {
+					rxe_counter_inc(rxe,
+							RXE_CNT_RCV_SEQ_ERR);
+					if (qp->req.wait_psn) {
+						qp->req.wait_psn = 0;
+						rxe_run_task(&qp->req.task, 0);
+					}
+				}
+				// update bitmap to set selective ack.
+				__uint128_t temp = 1; //BDP-bit
+				temp = temp << (pkt->psn - qp->comp.psn);
+				qp->comp.sack_bitmap = qp->comp.sack_bitmap | temp; //mark sack bitmap
+				if(qp->req.inRecovery) {
+					//if packet set for retransmission is selectively acked, don't retransmit it, and find new hole instead.
+					if(qp->req.doRetransmit && (qp->req.retransmitSN == pkt->psn)) {
+						qp->req.findNewHole = true;
+						qp->req.doRetransmit = false;
+					}
+					//if the sack creation leads to new holes, and retransmit flag is not set to true,
+					//set flag to find new holes.
+					else if(!qp->req.doRetransmit) {
+						__uint128_t temp2 = qp->comp.sack_bitmap >> (pkt->psn - qp->comp.psn + 1);
+						if(temp2 == 0) {
+							qp->req.findNewHole = true;
+						}
+					}
+				}
+				//when cumulative ack is greater than recovery sequence,
+				//exit recovery and disable flags for retransmission and bitmap lookup.
+				if (psn_compare(cumAck, qp->req.recoverSN) > 0) {
+					qp->req.inRecovery = false;
+					qp->req.findNewHole = false;
+					qp->req.doRetransmit = false;
+				}
+				//if new packets have been acked,
+				if (newAck) {
+					if(qp->req.inRecovery) {
+						//partial ack: retransmit this packet only if it has not already been retransmitted. i.e. update retransmitSN to avoid duplicate retransmit.
+						if((qp->req.retransmitSN < qp->comp.psn) || ((qp->req.retransmitSN == qp->comp.psn) && (qp->req.doRetransmit))) {
+							qp->req.retransmitSN = qp->comp.psn;
+							qp->req.doRetransmit = true;
+							qp->req.findNewHole = false;
+						}
+					}
+				} else {
+					if(!qp->req.inRecovery) {
+						//first duplicated cumulative ack.
+						//check if it is due to a valid lost packet. Start retransmission.
+						if (psn_compare(qp->comp.psn, qp->req.nextSNtoSend) < 0) {
+							qp->req.retransmitSN = qp->comp.psn;
+							qp->req.doRetransmit = true;
+							qp->req.findNewHole = false;
+							rxe_run_task(&qp->req.task, 0);
+						}
+					}
+				}
+				return COMPST_WRITE_SEND;
 
 			case AETH_NAK_INVALID_REQ:
 				wqe->status = IB_WC_REM_INV_REQ_ERR;
@@ -415,24 +507,59 @@ static void make_send_cqe(struct rxe_qp *qp, struct rxe_send_wqe *wqe,
  * indicator requests an Unsignaled Completion.
  * ---------8<---------8<-------------
  */
-static void do_complete(struct rxe_qp *qp, struct rxe_send_wqe *wqe)
+static int do_complete(struct rxe_qp *qp, struct rxe_send_wqe *wqe, u8 numCQEdone)
 {
 	struct rxe_dev *rxe = to_rdev(qp->ibqp.device);
 	struct rxe_cqe cqe;
-	bool post;
 
-	/* do we need to post a completion */
-	post = ((qp->sq_sig_type == IB_SIGNAL_ALL_WR) ||
-			(wqe->wr.send_flags & IB_SEND_SIGNALED) ||
-			wqe->status != IB_WC_SUCCESS);
+	int err;
+	struct rxe_sq *ssq = &qp->ssq;
+	struct rxe_send_wqe *save_send_wqe;
+	struct rxe_send_wqe *expire_send_wqe;
+	unsigned long flags;
+	unsigned int save_wqe_index;
 
-	if (post)
-		make_send_cqe(qp, wqe, &cqe);
+	if ((qp->sq_sig_type == IB_SIGNAL_ALL_WR) ||
+	    (wqe->wr.send_flags & IB_SEND_SIGNALED) ||
+	    wqe->status != IB_WC_SUCCESS) {
+		spin_lock_irqsave(&qp->ssq.sq_lock, flags);
 
-	queue_advance_consumer(qp->sq.queue, QUEUE_TYPE_FROM_CLIENT);
+		if (unlikely(queue_full(ssq->queue, QUEUE_TYPE_FROM_CLIENT))) {
+			err = -ENOMEM;
+			goto err1;
+		}
 
-	if (post)
+		save_send_wqe = queue_producer_addr(ssq->queue, QUEUE_TYPE_FROM_CLIENT);
+		*save_send_wqe = *wqe;
+
+		queue_advance_producer(ssq->queue,QUEUE_TYPE_TO_CLIENT);
+		spin_unlock_irqrestore(&qp->ssq.sq_lock, flags);
+		pr_alert("wqe saved");
+
+
+		if(unlikely(queue_empty(ssq->queue, QUEUE_TYPE_FROM_CLIENT))){
+			err = -ENOMEM;
+			return err;
+		}
+
+		while (numCQEdone != 0 && !queue_empty(ssq->queue, QUEUE_TYPE_FROM_CLIENT)) {
+		expire_send_wqe = queue_head(qp->ssq.queue, QUEUE_TYPE_FROM_CLIENT);
+
+		make_send_cqe(qp, expire_send_wqe, &cqe);
 		rxe_cq_post(qp->scq, &cqe, 0);
+		queue_advance_consumer(qp->ssq.queue, QUEUE_TYPE_FROM_CLIENT);
+
+		numCQEdone--;
+		pr_alert("cqe posted");
+		}
+		spin_lock_irqsave(&qp->sq.sq_lock, flags);
+		queue_advance_consumer(qp->sq.queue, QUEUE_TYPE_FROM_CLIENT);
+		spin_unlock_irqrestore(&qp->sq.sq_lock, flags);
+		pr_alert("sq advanced");
+	} else {
+		queue_advance_consumer(qp->sq.queue, QUEUE_TYPE_FROM_CLIENT);
+		pr_alert("sq advance without cqe");
+	}
 
 	if (wqe->wr.opcode == IB_WR_SEND ||
 	    wqe->wr.opcode == IB_WR_SEND_WITH_IMM ||
@@ -447,6 +574,10 @@ static void do_complete(struct rxe_qp *qp, struct rxe_send_wqe *wqe)
 		qp->req.wait_fence = 0;
 		rxe_run_task(&qp->req.task, 0);
 	}
+	return 0;
+	err1:
+	spin_unlock_irqrestore(&qp->ssq.sq_lock, flags);
+	return err;
 }
 
 static inline enum comp_state complete_ack(struct rxe_qp *qp,
@@ -454,6 +585,7 @@ static inline enum comp_state complete_ack(struct rxe_qp *qp,
 					   struct rxe_send_wqe *wqe)
 {
 	unsigned long flags;
+	unsigned int err;
 
 	if (wqe->has_rd_atomic) {
 		wqe->has_rd_atomic = 0;
@@ -487,7 +619,12 @@ static inline enum comp_state complete_ack(struct rxe_qp *qp,
 		}
 	}
 
-	do_complete(qp, wqe);
+	u8 numCQEdone = aeth_ncqe(pkt);
+	pr_alert("via comp ack");
+	err = do_complete(qp, wqe, numCQEdone);
+
+	if(err)
+		return COMPST_CQEERR;
 
 	if (psn_compare(pkt->psn, qp->comp.psn) >= 0)
 		return COMPST_UPDATE_COMP;
@@ -499,6 +636,8 @@ static inline enum comp_state complete_wqe(struct rxe_qp *qp,
 					   struct rxe_pkt_info *pkt,
 					   struct rxe_send_wqe *wqe)
 {
+	unsigned int err;
+
 	if (pkt && wqe->state == wqe_state_pending) {
 		if (psn_compare(wqe->last_psn, qp->comp.psn) >= 0) {
 			qp->comp.psn = (wqe->last_psn + 1) & BTH_PSN_MASK;
@@ -511,7 +650,12 @@ static inline enum comp_state complete_wqe(struct rxe_qp *qp,
 		}
 	}
 
-	do_complete(qp, wqe);
+	u8 numCQEdone = aeth_ncqe(pkt);
+	pr_alert("via comp wqe");
+	err = do_complete(qp, wqe, numCQEdone);
+
+	if(err)
+		return COMPST_CQEERR;
 
 	return COMPST_GET_WQE;
 }
@@ -531,7 +675,7 @@ static void rxe_drain_resp_pkts(struct rxe_qp *qp, bool notify)
 	while ((wqe = queue_head(q, q->type))) {
 		if (notify) {
 			wqe->status = IB_WC_WR_FLUSH_ERR;
-			do_complete(qp, wqe);
+			do_complete(qp, wqe, 1);
 		} else {
 			queue_advance_consumer(q, q->type);
 		}
@@ -668,7 +812,7 @@ int rxe_completer(void *arg)
 			 */
 			if ((qp_type(qp) == IB_QPT_RC) &&
 			    (qp->req.state == QP_STATE_READY) &&
-			    (psn_compare(qp->req.psn, qp->comp.psn) > 0) &&
+			    (psn_compare(qp->req.nextSNtoSend, qp->comp.psn) > 0) &&
 			    qp->qp_timeout_jiffies)
 				mod_timer(&qp->retrans_timer,
 					  jiffies + qp->qp_timeout_jiffies);
@@ -686,6 +830,7 @@ int rxe_completer(void *arg)
 
 			/* there is nothing to retry in this case */
 			if (!wqe || (wqe->state == wqe_state_posted)) {
+				pr_warn("Retry attempted without a valid wqe\n");
 				ret = -EAGAIN;
 				goto done;
 			}
@@ -748,10 +893,19 @@ int rxe_completer(void *arg)
 
 		case COMPST_ERROR:
 			WARN_ON_ONCE(wqe->status == IB_WC_SUCCESS);
-			do_complete(qp, wqe);
+			do_complete(qp, wqe, 1);
 			rxe_qp_error(qp);
 			ret = -EAGAIN;
 			goto done;
+
+		case COMPST_CQEERR:
+			WARN_ON_ONCE(wqe->status == IB_WC_SUCCESS);
+			pr_debug("qp#%d cqe process error\n",
+					 qp_num(qp));
+			ret = -ENOMEM;
+			goto done;
+
+
 		}
 	}
 

@@ -10,9 +10,35 @@
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
 #include <rdma/rdma_user_rxe.h>
+#include <stdbool.h>
 #include "rxe_pool.h"
 #include "rxe_task.h"
 #include "rxe_hw_counters.h"
+
+#if defined __has_builtin
+#	if __has_builtin (__builtin_popcount)
+#		define popcount32(bitmap) __builtin_popcount(bitmap)
+#	else
+		static inline int popcount32(uint32_t i)
+		{
+     		i = i - ((i >> 1) & 0x55555555);        // add pairs of bits
+     		i = (i & 0x33333333) + ((i >> 2) & 0x33333333);  // quads
+     		i = (i + (i >> 4)) & 0x0F0F0F0F;        // groups of 8
+     		i *= 0x01010101;                        // horizontal sum of bytes
+     		return  i >> 24;               // return just that top byte (after truncating to 32-bit even when int is wider than uint32_t)
+		}
+#	endif
+#else
+static inline int popcount32(uint32_t i)
+{
+     i = i - ((i >> 1) & 0x55555555);        // add pairs of bits
+     i = (i & 0x33333333) + ((i >> 2) & 0x33333333);  // quads
+     i = (i + (i >> 4)) & 0x0F0F0F0F;        // groups of 8
+     i *= 0x01010101;                        // horizontal sum of bytes
+     return  i >> 24;               // return just that top byte (after truncating to 32-bit even when int is wider than uint32_t)
+}
+#endif
+
 
 static inline int pkey_match(u16 key1, u16 key2)
 {
@@ -31,6 +57,17 @@ static inline int psn_compare(u32 psn_a, u32 psn_b)
 
 	diff = (psn_a - psn_b) << 8;
 	return diff;
+}
+
+//extract a specific range of bits , denoted by [low,high]. LSB starts at pos 0.
+static inline u32 extractBits(__uint128_t num, int low, int high) {
+    // Create a mask to select the desired bits.
+    __uint128_t mask = ((1 << (high - low + 1)) - 1) << low;
+
+    // Use bitwise AND to extract the bits.
+    u32 result = (num & mask) >> low;
+
+    return result;
 }
 
 struct rxe_ucontext {
@@ -112,10 +149,19 @@ enum rxe_qp_state {
 	QP_STATE_ERROR
 };
 
+//bitmap size parameters, can be replaced with other reliably estimated parameters.
+#define BDP 128
+#define LOGBDP 7
+#define BDPBY32 4
+
+
 struct rxe_req_info {
 	enum rxe_qp_state	state;
 	int			wqe_index;
-	u32			psn;
+	u32			psn; // 24bit, psn to be sent via TX.
+	u32			nextSNtoSend;// next new packet psn to be sent.
+	u32			retransmitSN; //24bit, current psn set for retransmission.
+	u32			recoverSN;	//24bit, latest sent pkt's PSN.
 	int			opcode;
 	atomic_t		rd_atomic;
 	int			wait_fence;
@@ -123,17 +169,21 @@ struct rxe_req_info {
 	int			wait_psn;
 	int			need_retry;
 	int			noack_pkts;
+	bool 		doRetransmit; // flag to determine whether to retransmit current hole.
+	bool 		inRecovery; // flag to enable/disable recovery mode.
+	bool 		findNewHole; // flag to determine whether to seek for a new hole to retransmit.
 	struct rxe_task		task;
 };
 
 struct rxe_comp_info {
-	u32			psn;
+	u32			psn; // 24bit, last psn of sequentially acked pkt.
 	int			opcode;
 	int			timeout;
 	int			timeout_retry;
 	int			started_retry;
 	u32			retry_cnt;
 	u32			rnr_retry;
+	__uint128_t	sack_bitmap; //BDP bit, bitmap to track sack packets.
 	struct rxe_task		task;
 };
 
@@ -168,15 +218,19 @@ struct resp_res {
 
 struct rxe_resp_info {
 	enum rxe_qp_state	state;
+	__uint128_t	ooo_bitmap1; //BDP bit precision, bitmap to track received packets
+	__uint128_t	ooo_bitmap2; //BDP bit precision, bitmap to track last packet
 	u32			msn;
-	u32			psn;
-	u32			ack_psn;
+	u32			psn; //expected PSN
+	u32			ack_psn; //cumACK PSN
+	//u32			sack_psn; //Selective ACK PSN
 	int			opcode;
 	int			drop_msg;
 	int			goto_error;
 	int			sent_psn_nak;
 	enum ib_wc_status	status;
 	u8			aeth_syndrome;
+	u8			numCQEdone; // number of CQEs to be expired in one run of completer for SR
 
 	/* Receive only */
 	struct rxe_recv_wqe	*wqe;
@@ -209,6 +263,7 @@ struct rxe_resp_info {
 struct rxe_qp {
 	struct ib_qp		ibqp;
 	struct rxe_pool_entry	pelem;
+	struct ib_qp		ibqp;
 	struct ib_qp_attr	attr;
 	unsigned int		valid;
 	unsigned int		mtu;
@@ -223,6 +278,7 @@ struct rxe_qp {
 
 	struct rxe_sq		sq;
 	struct rxe_rq		rq;
+	struct rxe_sq		ssq;//queue for saving premature completed wqe for cqe operations.
 
 	struct socket		*sk;
 	u32			dst_cookie;
@@ -306,7 +362,7 @@ static inline int rkey_is_mw(u32 rkey)
 
 struct rxe_mr {
 	struct rxe_pool_entry	pelem;
-	struct ib_mr		ibmr;
+		struct ib_mr		ibmr;
 
 	struct ib_umem		*umem;
 

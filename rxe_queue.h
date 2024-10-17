@@ -82,7 +82,10 @@ struct rxe_queue *rxe_queue_init(struct rxe_dev *rxe, int *num_elem,
 int rxe_queue_resize(struct rxe_queue *q, unsigned int *num_elem_p,
 		     unsigned int elem_size, struct ib_udata *udata,
 		     struct mminfo __user *outbuf,
-		     spinlock_t *producer_lock, spinlock_t *consumer_lock);
+		     /* Protect producers while resizing queue */
+		     spinlock_t *producer_lock,
+		     /* Protect consumers while resizing queue */
+		     spinlock_t *consumer_lock);
 
 void rxe_queue_cleanup(struct rxe_queue *queue);
 
@@ -134,7 +137,7 @@ static inline u32 queue_get_consumer(const struct rxe_queue *q,
 		break;
 	case QUEUE_TYPE_TO_DRIVER:
 		/* protect driver index */
-		cons = smp_load_acquire(&q->buf->consumer_index);
+	cons = smp_load_acquire(&q->buf->consumer_index);
 		break;
 	}
 
@@ -181,7 +184,7 @@ static inline void queue_advance_producer(struct rxe_queue *q,
 		prod = (prod + 1) & q->index_mask;
 		q->index = prod;
 		/* protect user index */
-		smp_store_release(&q->buf->producer_index, prod);
+	smp_store_release(&q->buf->producer_index, prod);
 		break;
 	case QUEUE_TYPE_FROM_DRIVER:
 		pr_warn("%s: attempt to advance driver index\n",
@@ -206,7 +209,7 @@ static inline void queue_advance_consumer(struct rxe_queue *q,
 		cons = (cons + 1) & q->index_mask;
 		q->index = cons;
 		/* protect user index */
-		smp_store_release(&q->buf->consumer_index, cons);
+	smp_store_release(&q->buf->consumer_index, cons);
 		break;
 	case QUEUE_TYPE_TO_CLIENT:
 		pr_warn("%s: attempt to advance client index\n",
@@ -247,10 +250,10 @@ static inline void *queue_addr_from_index(struct rxe_queue *q, u32 index)
 }
 
 static inline u32 queue_index_from_addr(const struct rxe_queue *q,
-				const void *addr)
+					   const void *addr)
 {
 	return (((u8 *)addr - q->buf->data) >> q->log2_elem_size)
-				& q->index_mask;
+		& q->index_mask;
 }
 
 static inline void *queue_head(struct rxe_queue *q, enum queue_type type)
